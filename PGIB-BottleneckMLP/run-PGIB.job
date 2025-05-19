@@ -1,0 +1,17 @@
+#!/bin/bash  -l
+#SBATCH --cpus-per-task=8
+
+cd $SLURM_SUBMIT_DIR
+
+/bin/hostname
+
+conda activate pgib-clean
+
+python -m models.train_gnns_bottleneckMLP --task mutag_128_32 --fc_dims 128 32 > out_mutag_128_32.out
+
+
+
+
+
+
+
