@@ -1,6 +1,6 @@
 ## Implementation of `BottleneckMLP: Graph Explanation via Implicit Information Bottleneck'
 
-![BottleneckMLP](https://github.com/CallieSardina/BottleneckMLP/bottlneckMLP.png "BottleneckMLP")
+![BottleneckMLP](https://github.com/CallieSardina/BottleneckMLP/BottlneckMLP.png "BottleneckMLP")
 
 
 Each directory within this repository contains the respective implementation & analysis/ visualization scrpits needed to recreate our work for each of the main explainers used within our paper.
@@ -14,3 +14,5 @@ GSAT: https://github.com/Graph-COM/GSAT/tree/main
 PGIB: https://github.com/sang-woo-seo/PGIB
 
 TGIB: https://github.com/sang-woo-seo/TGIB
+
+![BottleneckMLP Full](https://github.com/CallieSardina/BottleneckMLP/BottlneckMLP_full.png "BottleneckMLP")
