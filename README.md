@@ -1,6 +1,6 @@
 ## Implementation of `BottleneckMLP: Graph Explanation via Implicit Information Bottleneck'
 
-![alt text](https://github.com/CallieSardina/BottleneckMLP/bottlneckMLP.png "BottleneckMLP")
+![BottleneckMLP](https://github.com/CallieSardina/BottleneckMLP/bottlneckMLP.png "BottleneckMLP")
 
 
 Each directory within this repository contains the respective implementation & analysis/ visualization scrpits needed to recreate our work for each of the main explainers used within our paper.
