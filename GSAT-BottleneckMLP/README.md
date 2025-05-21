@@ -16,4 +16,4 @@ run_gsat.py uses the backbone specified.
 
 ## Visualizations and Analysis
 
-For plotting I(X;Z) and info loss run run_gsat_kl_plot.py For plotting I(X;Z) vs I(Z;Y) over layers, run run_gsat_layers_in_GIN.py with the command above. 
+For plotting I(X;Z) and info loss run run_gsat_kl_plot.py. For plotting I(X;Z) vs I(Z;Y) over layers, run run_gsat_layers_in_GIN.py with the command above. 
