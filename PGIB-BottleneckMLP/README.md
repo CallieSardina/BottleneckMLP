@@ -42,7 +42,7 @@ to plot I(X;Z) over epochs.
 ``` 
 to plot I(Z;Y) over epochs.
 
-#### To recreate Figure 3:
+#### To recreate NSA plots:
 
 First run 
 ```
@@ -56,7 +56,13 @@ Then run
 ```
 to visualize the graphs.
 
-#### To recreate Figures 5 & 6:
+#### To recreate Drift plots:
+Run
+```
+./similarity_utils/ calc_drift_per_cat.py
+```
+
+#### To recreate Convex Hull Volume plots:
 
 First run
 ```
