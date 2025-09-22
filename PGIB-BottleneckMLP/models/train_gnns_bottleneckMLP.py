@@ -27,6 +27,8 @@ from copy import deepcopy
 from torch_geometric.nn import global_mean_pool
 from similarity_metrics import *
 from similarity_metrics import LNSA_loss
+import json
+from collections import defaultdict
 
 
 def warm_only(model):
@@ -104,6 +106,10 @@ def train_GC(model_type, args):
 
     best_acc = 0.0
 
+    node_embedding_tracker = defaultdict(list)
+    node_drift_tracker = defaultdict(list)  
+    category_drift_log = defaultdict(list) 
+
     for epoch in range(train_args.max_epochs):
         acc = []
         loss_list = []
@@ -145,35 +151,45 @@ def train_GC(model_type, args):
 
         for i, batch in enumerate(dataloader['train']):
             if model_args.cont:
-                logits, probs, active_node_index, graph_emb, KL_Loss, connectivity_loss, sim_matrix, min_distance, topk_node_index, bottomk_node_index, mlp_embeddings = gnnNets(batch)
+                logits, probs, active_node_index, graph_emb, KL_Loss, connectivity_loss, sim_matrix, min_distance, topk_node_index, bottomk_node_index, mlp_embeddings, lambda_pos = gnnNets(batch)
             else:
-                logits, probs, active_node_index, graph_emb, KL_Loss, connectivity_loss, prototype_pred_loss, min_distance, topk_node_index, bottomk_node_index, mlp_embeddings = gnnNets(batch) 
-
-            # # HERE 
-            # print("active node index: ", active_node_index)
-            # # print(tmp)
-
-
-            # TODO: compute MI between embeddings # HERE
-            # for key in embeddings:
-            #     print(f"{key} embedding shape: {embeddings[key].shape}")
+                logits, probs, active_node_index, graph_emb, KL_Loss, connectivity_loss, prototype_pred_loss, min_distance, topk_node_index, bottomk_node_index, mlp_embeddings, lambda_pos = gnnNets(batch) 
 
             if batch.num_graphs < 10:
-                continue
+                continue     
 
-            # print("graph emb shape: ", graph_emb.shape)
-            # print("y shape: ", batch.y.shape)
 
-            # for name, tensor in embeddings.items():
-            #     print(f"{name}: {tensor.shape}")
+            if epoch > 50:
+                # Progress in training (0 → 1)
+                progress = epoch / float(train_args.max_epochs)
 
-            # # print(f"batch type: {type(batch)}, batch contents: {batch}")
-            # for key in embeddings:
-            #     if embeddings[key].shape[0] != batch.y.shape[0]:
-            #         embeddings[key] = torch_scatter.scatter(embeddings[key] , batch.batch, dim=0, reduce="mean")  # Shape: [batch_size, emb_dim]
-            
-            for key in mlp_embeddings:
-                print(f"{key} embedding shape: {mlp_embeddings[key].shape}")
+                # Linearly scale the maximum possible noise from 0 → 0.5
+                max_noise = 0.5 * progress
+
+                # Node embeddings and importance scores
+                node_emb = mlp_embeddings['node_embs']
+                importance_scores = lambda_pos  # [num_nodes, 1]
+
+                # Inverse scaling based on importance (avoid div by zero)
+                scale = 1.0 / (importance_scores + 1e-6)
+
+                # Normalize scale to [0, 1] and multiply by max_noise
+                scale = (scale / scale.max()) * max_noise
+
+                # Reshape to (N, 1) for broadcasting
+                scale = scale.view(-1, 1)
+
+                # Add Gaussian noise
+                noise = torch.randn_like(node_emb) * scale
+                noisy_node_emb = node_emb + noise
+
+                mlp_embeddings['node_embs'] = noisy_node_emb
+
+
+            # mlp_embeddings['node_embs'] = noisy_node_emb  # replace original embeddings
+
+            # for key in mlp_embeddings:
+            #     print(f"{key} embedding shape: {mlp_embeddings[key].shape}")
 
             # mi_XZ = [EDGE(embeddings['gnn_layer_0'].cpu().detach().numpy(), embeddings[key].clone().detach().numpy()) for key in embeddings]
             mi_XZ = [EDGE(mlp_embeddings[key].clone().detach().numpy(), mlp_embeddings[key].clone().detach().numpy()) for key in mlp_embeddings]
@@ -183,47 +199,266 @@ def train_GC(model_type, args):
             with open(f'./MI_logs/{task}.txt', 'a') as f:
                 print(f"Epoch {epoch}, MI_XZ: {mi_XZ}, MI_ZY: {mi_ZY}", file=f)
 
-            # HERE add Danish's similarity metrics
-            # HERE QUESTION: what about batching?
-            # Compute similarity metrics
-            # nsa = NSALoss()
-            # lnsa = LNSA_loss(k=40)
-            # # pick k to be what fraction of the space you reallly care about 1/50 or 1/100 of the data size is usually a good number
-            # #unless you data is really large in which case try not to go above k=1000 or 2000
+            batch_indices = batch.batch  # tensor of shape [num_nodes]
+            num_graphs = batch.num_graphs
 
+            category1_indices = []
+            category2_indices = []
+            category3_indices = []
 
-            # space1 = mlp_embeddings['node_embs']
-            # space2 = mlp_embeddings['layer_2']
+            for g in range(num_graphs):
+                node_mask = (batch_indices == g)
+                local_node_indices = node_mask.nonzero(as_tuple=True)[0]
 
-            # print("space1 shape: ", space1.shape)
-            # print("space2 shape: ", space2.shape)
+                # Map global -> local and vice versa
+                global_to_local = {int(idx): i for i, idx in enumerate(local_node_indices)}
+                local_to_global = {v: k for k, v in global_to_local.items()}
 
-            # space1_np = space1.cpu().detach().numpy()
-            # space2_np = space2.cpu().detach().numpy()
+                # Get active node indices for this graph
+                graph_active = active_node_index[g]
+                if not isinstance(graph_active, list):
+                    graph_active = [graph_active]
+                active_nodes_global = set(int(idx) for idx in graph_active)
 
-            # cka_value = 5 #cka(space1_np, space2_np)
-            # # space1 = torch.tensor(space1)
-            # # space2 = torch.tensor(space2)
-            # rtd_value = rtd(space1, space2)
-            # nsa_value = nsa(space1, space2) + lnsa(space1,space2)
+                # Only keep active nodes that are in this graph
+                active_nodes_local = [global_to_local[idx] for idx in active_nodes_global if idx in global_to_local]
+                active_nodes_set = set(active_nodes_local)
+
+                # Build edge index for graph g
+                edge_mask = node_mask[batch.edge_index[0]] & node_mask[batch.edge_index[1]]
+                edge_index_g = batch.edge_index[:, edge_mask]
+
+                # Reindex to local
+                edge_index_g_reindexed = edge_index_g.clone()
+                edge_index_g_reindexed[0] = edge_index_g[0].apply_(lambda x: global_to_local.get(int(x), -1))
+                edge_index_g_reindexed[1] = edge_index_g[1].apply_(lambda x: global_to_local.get(int(x), -1))
+
+                # Remove any -1 (invalid) edges
+                valid_mask = (edge_index_g_reindexed[0] >= 0) & (edge_index_g_reindexed[1] >= 0)
+                edge_index_g_reindexed = edge_index_g_reindexed[:, valid_mask]
+
+                # Build adjacency dict
+                adj_dict = defaultdict(set)
+                for src, dst in edge_index_g_reindexed.t().tolist():
+                    adj_dict[src].add(dst)
+                    adj_dict[dst].add(src)
+
+                # Categorize nodes
+                category_1, category_2, category_3 = [], [], []
+
+                for node in range(len(local_node_indices)):  # iterate only over local node indices
+                    neighbors = adj_dict.get(node, set())
+                    is_active = node in active_nodes_set
+                    has_active_neighbors = any(n in active_nodes_set for n in neighbors)
+                    has_inactive_neighbors = any(n not in active_nodes_set for n in neighbors)
+
+                    if is_active:
+                        if has_active_neighbors and has_inactive_neighbors:
+                            category_2.append(local_to_global[node])
+                        elif has_active_neighbors and not has_inactive_neighbors:
+                            category_1.append(local_to_global[node])
+                    else:
+                        if not has_active_neighbors and len(neighbors) > 0:
+                            category_3.append(local_to_global[node])
                 
-            # values = {"CKA": cka_value,
-            #         "RTD": rtd_value,
-            #         "NSA+LNSA (k={})".format(k): nsa_value}
+                category1_indices.extend(category_1)
+                category2_indices.extend(category_2)
+                category3_indices.extend(category_3)
 
-            # # Run the pipeline
 
-            # # Print results
-            # for metric, value in values.items():
-            #     print(f"{metric}: {value}")
+                os.makedirs(f"indices_per_graph_{task}", exist_ok=True)
+                torch.save(torch.tensor(category_1), f"./indices_per_graph_{task}/category1_graph_{g}_epoch_{epoch}.pt")
+                torch.save(torch.tensor(category_2), f"./indices_per_graph_{task}/category2_graph_{g}_epoch_{epoch}.pt")
+                torch.save(torch.tensor(category_3), f"./indices_per_graph_{task}/category3_graph_{g}_epoch_{epoch}.pt")
+      
+            category1_indices = torch.tensor(category1_indices, dtype=torch.long, device=model_args.device)
+            category2_indices = torch.tensor(category2_indices, dtype=torch.long, device=model_args.device)
+            category3_indices = torch.tensor(category3_indices, dtype=torch.long, device=model_args.device)
 
-            # with open(f'./similarity_logs/{task}.txt', 'a') as f:
-            #     print(f"Epoch {epoch}, CKA: {values['CKA']}, RTD: {values['RTD']}, NSA+LNSA: {values['NSA+LNSA (k={})'.format(k)]}", file=f)
+            os.makedirs(f"indices_per_batch_{task}", exist_ok=True)
+            torch.save(category1_indices, f"./indices_per_batch_{task}/category1_indices_epoch_{epoch}.pt")
+            torch.save(category2_indices, f"./indices_per_batch_{task}/category2_indices_epoch_{epoch}.pt")
+            torch.save(category3_indices, f"./indices_per_batch_{task}/category3_indices_epoch_{epoch}.pt")
 
-            # # HERE debugging -- changed this because I used the processed data from GSAT, so batch.y was formatted differently.
-            #loss = criterion(logits, batch.y.squeeze().long())
+            space1 = mlp_embeddings['node_embs'].detach().to(model_args.device)
+            space2 = mlp_embeddings['layer_0'].detach().to(model_args.device)
+            space3 = mlp_embeddings['layer_1'].detach().to(model_args.device)
+            space4 = mlp_embeddings['layer_2'].detach().to(model_args.device)
+            space5 = mlp_embeddings['last_layer'].detach().to(model_args.device)
+
+            # For category 1
+            space1_cat1 = space1[category1_indices]
+            space2_cat1 = space2[category1_indices]
+            space3_cat1 = space3[category1_indices]
+            space4_cat1 = space4[category1_indices]
+            space5_cat1 = space5[category1_indices]
+
+            # print("space 1: ", space1)
+            # print("space1_cat1: ", space1_cat1)
+   
+            # For category 2
+            space1_cat2 = space1[category2_indices]
+            space2_cat2 = space2[category2_indices]
+            space3_cat2 = space3[category2_indices]
+            space4_cat2 = space4[category2_indices]
+            space5_cat2 = space5[category2_indices]
+
+            # For category 3
+            space1_cat3 = space1[category3_indices]
+            space2_cat3 = space2[category3_indices]
+            space3_cat3 = space3[category3_indices]
+            space4_cat3 = space4[category3_indices]
+            space5_cat3 = space5[category3_indices]
+
+            # nsa = NSALoss()
+            # lnsa = LNSA_loss(k=40)         
+
+            # try:
+            #     lnsa_cat1_space12 = lnsa(space1_cat1, space2_cat1)
+            # except Exception:
+            #     lnsa_cat1_space12 = 0
+            # try:
+            #     lnsa_cat1_space13 = lnsa(space1_cat1, space3_cat1)
+            # except Exception:
+            #     lnsa_cat1_space13 = 0
+            # try:
+            #     lnsa_cat1_space14 = lnsa(space1_cat1, space4_cat1)
+            # except Exception:
+            #     lnsa_cat1_space14 = 0
+            # try:
+            #     lnsa_cat1_space15 = lnsa(space1_cat1, space5_cat1)
+            # except Exception:
+            #     lnsa_cat1_space15 = 0
+        
+            # try:
+            #     nsa_cat1_space12 = nsa(space1_cat1, space2_cat1) + lnsa_cat3_space12
+            # except Exception:
+            #     nsa_cat1_space12 = 0
+            # try: 
+            #     nsa_cat1_space13 = nsa(space1_cat1, space3_cat1) + lnsa_cat3_space13
+            # except Exception:
+            #     nsa_cat1_space13 = 0
+            # try:
+            #     nsa_cat1_space14 = nsa(space1_cat1, space4_cat1) + lnsa_cat3_space14
+            # except Exception:
+            #     nsa_cat1_space14 = 0
+            # try: 
+            #     nsa_cat1_space15 = nsa(space1_cat1, space5_cat1) + lnsa_cat3_space15
+            # except Exception:
+            #     nsa_cat1_space15 = 0
+
+            # with open(f'./similarity_logs/{task}_cat1_train_tmp.txt', 'a') as f:
+            #     print(f"Epoch {epoch}, NSA+LNSA: {nsa_cat1_space12}, {nsa_cat1_space13}, {nsa_cat1_space14}, {nsa_cat1_space15}, LNSA: {lnsa_cat1_space12}, {lnsa_cat1_space13}, {lnsa_cat1_space14}, {lnsa_cat1_space15}", file=f)
+
+            # try:
+            #     lnsa_cat2_space12 = lnsa(space1_cat2, space2_cat2)
+            # except Exception:
+            #     lnsa_cat2_space12 = 0
+            # try:
+            #     lnsa_cat2_space13 = lnsa(space1_cat2, space3_cat2)
+            # except Exception:
+            #     lnsa_cat2_space13 = 0
+            # try:
+            #     lnsa_cat2_space14 = lnsa(space1_cat2, space4_cat2)
+            # except Exception:
+            #     lnsa_cat2_space14 = 0
+            # try:
+            #     lnsa_cat2_space15 = lnsa(space1_cat2, space5_cat2)
+            # except Exception:
+            #     lnsa_cat2_space15 = 0
+        
+            # try:
+            #     nsa_cat2_space12 = nsa(space1_cat2, space2_cat2) + lnsa_cat2_space12
+            # except Exception:
+            #     nsa_cat2_space12 = 0
+            # try: 
+            #     nsa_cat2_space13 = nsa(space1_cat2, space3_cat2) + lnsa_cat2_space13
+            # except Exception:
+            #     nsa_cat2_space13 = 0
+            # try:
+            #     nsa_cat2_space14 = nsa(space1_cat2, space4_cat2) + lnsa_cat2_space14
+            # except Exception:
+            #     nsa_cat2_space14 = 0
+            # try: 
+            #     nsa_cat2_space15 = nsa(space1_cat2, space5_cat2) + lnsa_cat2_space15
+            # except Exception:
+            #     nsa_cat2_space15 = 0
+
+            # with open(f'./similarity_logs/{task}_cat2_train_tmp.txt', 'a') as f:
+            #     print(f"Epoch {epoch}, NSA+LNSA: {nsa_cat2_space12}, {nsa_cat2_space13}, {nsa_cat2_space14}, {nsa_cat2_space15}, LNSA: {lnsa_cat2_space12}, {lnsa_cat2_space13}, {lnsa_cat2_space14}, {lnsa_cat2_space15}", file=f)
+
+            # try:
+            #     lnsa_cat3_space12 = lnsa(space1_cat3, space2_cat3)
+            # except Exception:
+            #     lnsa_cat3_space12 = 0
+            # try:
+            #     lnsa_cat3_space13 = lnsa(space1_cat3, space3_cat3)
+            # except Exception:
+            #     lnsa_cat3_space13 = 0
+            # try:
+            #     lnsa_cat3_space14 = lnsa(space1_cat3, space4_cat3)
+            # except Exception:
+            #     lnsa_cat3_space14 = 0
+            # try:
+            #     lnsa_cat3_space15 = lnsa(space1_cat3, space5_cat3)
+            # except Exception:
+            #     lnsa_cat3_space15 = 0
+        
+            # try:
+            #     nsa_cat3_space12 = nsa(space1_cat3, space2_cat3) + lnsa_cat3_space12
+            # except Exception:
+            #     nsa_cat3_space12 = 0
+            # try: 
+            #     nsa_cat3_space13 = nsa(space1_cat3, space3_cat3) + lnsa_cat3_space13
+            # except Exception:
+            #     nsa_cat3_space13 = 0
+            # try:
+            #     nsa_cat3_space14 = nsa(space1_cat3, space4_cat3) + lnsa_cat3_space14
+            # except Exception:
+            #     nsa_cat3_space14 = 0
+            # try: 
+            #     nsa_cat3_space15 = nsa(space1_cat3, space5_cat3) + lnsa_cat3_space15
+            # except Exception:
+            #     nsa_cat3_space15 = 0
+
+            # with open(f'./similarity_logs/{task}_cat3_train_tmp.txt', 'a') as f:
+            #     print(f"Epoch {epoch}, NSA+LNSA: {nsa_cat3_space12}, {nsa_cat3_space13}, {nsa_cat3_space14}, {nsa_cat3_space15}, LNSA: {lnsa_cat3_space12}, {lnsa_cat3_space13}, {lnsa_cat3_space14}, {lnsa_cat3_space15}", file=f)
+
+
+            def get_average_drift(indices, drift_dict):
+                return np.mean([np.mean(drift_dict[i]) for i in indices if i in drift_dict and drift_dict[i]]) if indices else 0.0
+
+            mean_drift_cat1 = get_average_drift(category1_indices.tolist(), node_drift_tracker)
+            mean_drift_cat2 = get_average_drift(category2_indices.tolist(), node_drift_tracker)
+            mean_drift_cat3 = get_average_drift(category3_indices.tolist(), node_drift_tracker)
+
+            category_drift_log['category1'].append(mean_drift_cat1)
+            category_drift_log['category2'].append(mean_drift_cat2)
+            category_drift_log['category3'].append(mean_drift_cat3)
+
+            print(f"[Epoch {epoch}] Avg Drift - Cat1: {mean_drift_cat1:.4f}, Cat2: {mean_drift_cat2:.4f}, Cat3: {mean_drift_cat3:.4f}")
+
+
             batch.y = batch.y.squeeze().long()
             loss = criterion(logits, batch.y)
+
+            # === Inside training loop, each epoch ===
+            with torch.no_grad():
+                current_node_embs = mlp_embeddings['node_embs'].detach().cpu()
+                
+                if hasattr(batch, 'node_idx'):  # Use node_idx if your batch includes it
+                    node_ids = batch.node_idx.cpu().numpy()
+                else:
+                    node_ids = np.arange(current_node_embs.shape[0])  # fallback
+
+                for idx, emb in zip(node_ids, current_node_embs):
+                    emb_np = emb.numpy()
+                    if node_embedding_tracker[idx]:  # if there's a previous embedding
+                        prev_emb = node_embedding_tracker[idx][-1]
+                        drift = np.linalg.norm(emb_np - prev_emb)
+                        node_drift_tracker[idx].append(drift)  # Store drift
+                    node_embedding_tracker[idx].append(emb_np)
+
 
             if model_args.cont:
                 prototypes_of_correct_class = torch.t(gnnNets.model.prototype_class_identity[:, batch.y]).to(model_args.device) 
@@ -258,6 +493,9 @@ def train_GC(model_type, args):
             with open(f'./for_KL_plot/with_MLP_{task}.txt', 'a') as f:
                 print(f"Epoch {epoch}, KL Loss: {KL_Loss}", file=f)
 
+            os.makedirs(f"mlp_embeddings_{task}", exist_ok=True)
+            torch.save(mlp_embeddings, f'./mlp_embeddings_{task}/embeddings_epoch_{epoch}.pt')
+
             # optimization
             optimizer.zero_grad()
             loss.backward()
@@ -270,97 +508,35 @@ def train_GC(model_type, args):
             ld_loss_list.append(ld.item())
             acc.append(prediction.eq(batch.y).cpu().numpy())
 
-            # HERE -- aucroc
-            # auroc_list = []
-            # for i in range(batch.num_graphs):
-            #     data = batch[i]
-            #     graph = to_networkx(data, to_undirected=True)
-            #     true_edge_labels = data.edge_label.cpu().numpy()
-            #     num_edges = true_edge_labels.shape[0]
-            #     edge_mask = get_edge_mask(graph, active_node_index[i], num_edges)
-            #     print("edge mask: ", edge_mask) # edge mask:  [(2, 5), (3, 7), (3, 8), (5, 15), (11, 18)]
-            #     pred_edge_scores = edge_mask.int().cpu().numpy()
-                
-            #     #print("pred edge scores: ", pred_edge_scores)
-            #     print("true edge labels: ", true_edge_labels)
-            #     print("true edge labels shape: ", true_edge_labels.shape)
-            #     try:
-            #         auroc = roc_auc_score(true_edge_labels, pred_edge_scores)
-            #         auroc_list.append(auroc)
-            #     except ValueError:
-            #         print("Skipping graph with only one class in ground truth edges.")
-            iou_list = []
-            for i in range(batch.num_graphs):
-                data = batch[i]
-                graph = to_networkx(data, to_undirected=True)
-                
-                # Get true edge labels and number of edges
-                true_edge_labels = data.edge_label.cpu().numpy()
-                num_edges = true_edge_labels.shape[0]
-                
-                # Get the edge mask for the active nodes in the subgraph
-                nodelist = active_node_index[i] # HERE active_node_index
-                if not isinstance(nodelist, list):
-                    continue
-                edge_mask = get_edge_mask(graph, nodelist, num_edges)
-                
-                # Convert edge mask to numpy array for AUROC calculation
-                pred_edge_scores = edge_mask.int().cpu().numpy()
-
-                intersection = len(set(pred_edge_scores) & set(true_edge_labels))
-                union = len(set(pred_edge_scores) | set(true_edge_labels))
-                iou = intersection / union
-                iou_list.append(iou)
-                # print("edge mask: ", edge_mask)  # Example: edge mask:  [1, 1, 1, 0, 0, 0, ...]
-                # print("true edge labels: ", true_edge_labels)
-                # print("true edge labels shape: ", true_edge_labels.shape)
-                # matching_count = (edge_mask.int().cpu().numpy() == true_edge_labels).sum()
-                # print(f"Number of times edge mask pred = true: {matching_count}")
-
-                # # Count the number of 0s and 1s in true_edge_labels
-                # count_zeros = (true_edge_labels == 0).sum()
-                # count_ones = (true_edge_labels == 1).sum()
-                # print(f"Count of 0s true_edge_labels: {count_zeros}")
-                # print(f"Count of 1s true_edge_labels: {count_ones}")
-
-                # # Count the number of 0s and 1s in pred_edge_scores
-                # count_zeros = (pred_edge_scores == 0).sum()
-                # count_ones = (pred_edge_scores == 1).sum()
-                # print(f"Count of 0s pred_edge_scores: {count_zeros}")
-                # print(f"Count of 1s pred_edge_scores: {count_ones}")
-
-                # if len(set(true_edge_labels)) > 1:  # Ensure both 0 and 1 are present
-                #     try:
-                #         auroc = roc_auc_score(true_edge_labels, edge_mask.int().cpu().numpy())
-                #         auroc_list.append(auroc)
-                #         # print("Calculating AUROC.")
-                #     except ValueError:
-                #         print("Error calculating AUROC.")
-                # else:
-                #     print("Skipping AUROC calculation: only one class present in true labels.")
-
-
         # report train msg
         print(f"Train Epoch:{epoch}  |Loss: {np.average(loss_list):.3f} | Ld: {np.average(ld_loss_list):.3f} | "
               f"Acc: {np.concatenate(acc, axis=0).mean():.3f}")
-        
-        # HERE --aucroc
-        # Track best AUROC
-        if iou_list:
-            mean_iou = np.mean(iou_list)
-            print(f"Epoch {epoch} | Mean AUROC: {mean_iou:.4f}")
-            append_record(f"Epoch {epoch}, mean AUROC: {mean_iou:.4f}", args)
-
-            # if mean_auroc > best_auroc:
-            #     best_auroc = mean_auroc
-            #     best_epoch = epoch
-            #     torch.save(gnnNets.state_dict(), os.path.join(ckpt_dir, 'best_model.pt'))
-            #     print(f"Best AUROC updated: {best_auroc:.4f} at epoch {epoch}")
-        else:
-            print(f"Epoch {epoch} | No valid AUROC scores")
 
         append_record("Epoch {:2d}, loss: {:.3f}, acc: {:.3f}".format(epoch, np.average(loss_list), np.concatenate(acc, axis=0).mean()), args)
 
+
+                # === After final epoch ===
+        if epoch == train_args.max_epochs - 1:
+            node_drift_stats = {}
+            for idx in node_embedding_tracker:
+                drifts = node_drift_tracker[idx]
+                node_drift_stats[idx] = {
+                    'mean_drift': float(np.mean(drifts)) if drifts else 0.0,
+                    'std_drift': float(np.std(drifts)) if drifts else 0.0,
+                    'num_updates': len(drifts)
+                }
+
+            with open(f'node_drift_stats_{task}.json', 'w') as f:
+                json.dump(node_drift_stats, f, indent=2)
+            print(f"Saved node drift stats to node_drift_stats_{task}.json")
+
+        os.makedirs("drift_logs", exist_ok=True)
+        converted_drift_log = {
+            k: [float(x) for x in v]
+            for k, v in category_drift_log.items()
+        }
+        with open("drift_logs/per_category_drift.json", "w") as f:
+            json.dump(converted_drift_log, f, indent=2)
 
         # report eval msg
         eval_state = evaluate_GC(dataloader['eval'], gnnNets, criterion)
@@ -368,7 +544,7 @@ def train_GC(model_type, args):
         append_record("Eval epoch {:2d}, loss: {:.3f}, acc: {:.3f}".format(epoch, eval_state['loss'], eval_state['acc']), args)
 
         test_state, _, _ = test_GC(dataloader['test'], gnnNets, criterion)
-        print(f"Test Epoch: {epoch} | Loss: {test_state['loss']:.3f} | Acc: {test_state['acc']:.3f} | IoU: {test_state['iou']:.3f} | Fid+: {test_state['fid+']:.3f} | Fid-: {test_state['fid-']:.3f}")           
+        print(f"Test Epoch: {epoch} | Loss: {test_state['loss']:.3f} | Acc: {test_state['acc']:.3f} | Fid+: {test_state['fid+']:.3f} | Fid-: {test_state['fid-']:.3f}")           
 
         # only save the best model
         is_best = (eval_state['acc'] > best_acc)
@@ -380,7 +556,7 @@ def train_GC(model_type, args):
 
         # HERE -- removed early stopping so we can run more epochs for IB
         if early_stop_count > train_args.early_stopping:
-            break
+            print("CONVERGENCE AT EPOCH: ", epoch)
 
         if is_best:
             best_acc = eval_state['acc']
@@ -388,19 +564,8 @@ def train_GC(model_type, args):
         if is_best or epoch % train_args.save_epoch == 0:
             save_best(ckpt_dir, epoch, gnnNets, model_args.model_name, eval_state['acc'], is_best, args)
 
-        # mean_auroc = np.mean(auroc_list) if auroc_list else 0.0
-        # print(f"Epoch {epoch}: AUROC = {mean_auroc:.4f}")
-
-        # if mean_auroc > best_auroc:
-        #     best_auroc = mean_auroc
-        #     best_auroc_epoch = epoch
-        #     print(f"New best AUROC: {best_auroc:.4f} at epoch {best_auroc_epoch}")
-
-
     print(f"The best validation accuracy is {best_acc}.")
 
-    if iou_list:
-        print("Final Mean AUROC across last epoch:", np.mean(iou_list))
     
     # # === After training ends ===
     # print(f"Loading best model from epoch {best_epoch} with AUROC {best_auroc:.4f}")
@@ -419,8 +584,8 @@ def train_GC(model_type, args):
     gnnNets = torch.load(os.path.join(ckpt_dir, f'{model_args.model_name}_{model_type}_{model_args.readout}_best_{task}.pth')) # .to_device()
     gnnNets.to_device()
     test_state, _, _ = test_GC(dataloader['test'], gnnNets, criterion)
-    print(f"Test | Dataset: {data_args.dataset_name:s} | model: {model_args.model_name:s}_{model_type:s} | Loss: {test_state['loss']:.3f} | Acc: {test_state['acc']:.3f} | IoU: {test_state['iou']:.3f} | Fid+: {test_state['fid+']:.3f} | Fid-: {test_state['fid-']:.3f}")
-    append_record("loss: {:.3f}, acc: {:.3f}, auroc: {:.3f}".format(test_state['loss'], test_state['acc'], test_state['iou']), args)
+    print(f"Test | Dataset: {data_args.dataset_name:s} | model: {model_args.model_name:s}_{model_type:s} | Loss: {test_state['loss']:.3f} | Acc: {test_state['acc']:.3f} | Fid+: {test_state['fid+']:.3f} | Fid-: {test_state['fid-']:.3f}")
+    append_record("loss: {:.3f}, acc: {:.3f}, auroc: {:.3f}".format(test_state['loss'], test_state['acc']), args)
 
     return test_state['acc']
 
@@ -433,7 +598,7 @@ def evaluate_GC(eval_dataloader, gnnNets, criterion):
         for batch in eval_dataloader:
             # HERE 
             batch.y = batch.y.squeeze().long()
-            logits, probs, _, _, _, _, _, _, _, _, _ = gnnNets(batch) # HERE , _
+            logits, probs, _, _, _, _, _, _, _, _, _, _ = gnnNets(batch) # HERE , _
             if data_args.dataset_name == 'clintox':
                 batch.y = torch.tensor([torch.argmax(i).item() for i in batch.y]).to(model_args.device)
             loss = criterion(logits, batch.y)
@@ -658,7 +823,7 @@ def test_GC(test_dataloader, gnnNets, criterion):
 
     with torch.no_grad():
         for batch_index, batch in enumerate(test_dataloader):
-            logits, probs, active_node_index, _, _, _, _, _, topk_node_index, bottomk_node_index, mlp_embeddings = gnnNets(batch) # HERE , _
+            logits, probs, active_node_index, _, _, _, _, _, topk_node_index, bottomk_node_index, mlp_embeddings, lambda_pos = gnnNets(batch) # HERE , _
             # HERE 
             batch.y = batch.y.squeeze().long()
             loss = criterion(logits, batch.y)
@@ -681,30 +846,15 @@ def test_GC(test_dataloader, gnnNets, criterion):
             #     plotutils.plot(graph, active_node_index[i], x=data.x,
             #                 figname=os.path.join(save_dir, f"example_{i}.png"))
     
-            iou_list = []
             fid_plus_list = []
             fid_minus_list = []
             for i in range(batch.num_graphs):
                 data = batch[i]
-                graph = to_networkx(data, to_undirected=True)
-                
-                # Get true edge labels and number of edges
-                true_edge_labels = data.edge_label.cpu().numpy()
-                num_edges = true_edge_labels.shape[0]
                 
                 # Get the edge mask for the active nodes in the subgraph
                 nodelist = active_node_index[i]
                 if not isinstance(nodelist, list):
                     continue
-                edge_mask = get_edge_mask(graph, nodelist, num_edges)
-                
-                # Convert edge mask to numpy array for AUROC calculation
-                pred_edge_scores = edge_mask.int().cpu().numpy()
-                
-                intersection = len(set(pred_edge_scores) & set(true_edge_labels))
-                union = len(set(pred_edge_scores) | set(true_edge_labels))
-                iou = intersection / union
-                iou_list.append(iou)
 
                 # if node is active and only has edges to other active nodes, category = 1
                 # if node is active and has edges to both active and inactive nodes, category = 2
@@ -786,7 +936,6 @@ def test_GC(test_dataloader, gnnNets, criterion):
 
     test_state = {'loss': np.average(loss_list),
                   'acc': np.average(np.concatenate(acc, axis=0).mean()),
-                  'iou':np.average(iou_list),
                   'fid+': np.average(fid_plus_list),
                   'fid-': np.average(fid_minus_list)}
 
