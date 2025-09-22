@@ -23,14 +23,14 @@ We provide additional files for our various experiemnts:
 
 Use the following instructions do recreate the figures from our paper in your own experiments.
 
-#### To recreate Figure 1:
+#### To recreate Information Plane:
 
 ```
 ./utils_edge_and_plots/plot_MI_embs.py
 ``` 
 to plot information planes: I(X;Z) vs. I(Z;Y) over epochs.
 
-#### To recreate Figure 2:
+#### To plot I(X;Z) over epochs:
 
 ```
 ./for_KL_plot/plot_MI_XZ_graph.py
