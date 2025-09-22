@@ -15,4 +15,4 @@ PGIB: https://github.com/sang-woo-seo/PGIB
 
 TGIB: https://github.com/sang-woo-seo/TGIB
 
-![BottleneckMLP Full](https://github.com/CallieSardina/BottleneckMLP/blob/main/BottleneckMLP_full.png "BottleneckMLP")
+
