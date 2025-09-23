@@ -16,6 +16,7 @@ from ogb.graphproppred import Evaluator
 from sklearn.metrics import roc_auc_score
 from rdkit import Chem
 import pickle as pkl
+import os
 
 from pretrain_clf import train_clf_one_seed
 from utils import Writer, Criterion, MLP, visualize_a_graph, save_checkpoint, load_checkpoint, get_preds, get_lr, set_seed, process_data
@@ -26,7 +27,7 @@ from utils import get_local_config_name, get_model, get_data_loaders, write_stat
 class GSAT(nn.Module):
 
     def __init__(self, clf, extractor, optimizer, scheduler, writer, device, model_dir, dataset_name, num_class, multi_label, random_state,
-                 method_config, shared_config):
+                 method_config, shared_config, gaussianize=False, max_gauss_var=0.05, max_gauss_schedule='fixed', nograd_on='on'):
         super().__init__()
         self.clf = clf
         self.extractor = extractor
@@ -39,6 +40,11 @@ class GSAT(nn.Module):
         self.dataset_name = dataset_name
         self.random_state = random_state
         self.method_name = method_config['method_name']
+        self.bottleneck_dim = method_config.get('bottleneck_dim', 'normal')
+        self.gaussianize = gaussianize
+        self.max_gauss_var = max_gauss_var
+        self.max_gauss_schedule = max_gauss_schedule
+        self.nograd_on = nograd_on
 
         self.learn_edge_att = shared_config['learn_edge_att']
         self.k = shared_config['precision_k']
@@ -69,7 +75,7 @@ class GSAT(nn.Module):
         info_loss = info_loss * self.info_loss_coef
 
         #change -eren
-        if exp_type.startswith('normal'):
+        if self.bottleneck_dim == 'normal':
             loss = pred_loss + info_loss
         else:
             loss = pred_loss
@@ -79,6 +85,142 @@ class GSAT(nn.Module):
 
     def forward_pass(self, data, epoch, training):
         emb = self.clf.get_emb(data.x, data.edge_index, batch=data.batch, edge_attr=data.edge_attr)
+        
+        
+        if self.gaussianize:
+            # Conditionally use torch.no_grad() based on nograd_on flag
+            if self.nograd_on == 'on':
+                with torch.no_grad():
+                    # Get attention scores from extractor
+                    att_eps = torch.sigmoid(self.extractor(emb, data.edge_index, data.batch)) + 1e-6
+
+                    if self.learn_edge_att:
+                        # Convert edge attention to node attention by averaging
+                        node_att = torch.zeros(emb.size(0), device=emb.device)
+
+                        # Squeeze to (num_edges,) then expand to (2, num_edges)
+                        edge_att_expanded = att_eps.squeeze(-1).unsqueeze(0).expand(2, -1)
+
+                        node_att.scatter_add_(0, data.edge_index.view(-1), edge_att_expanded.reshape(-1))
+
+                        # Count edges per node for averaging
+                        edge_count = torch.zeros(emb.size(0), device=emb.device)
+                        edge_count.scatter_add_(0, data.edge_index.view(-1),
+                                                torch.ones_like(data.edge_index.view(-1), dtype=torch.float))
+                        edge_count = torch.clamp(edge_count, min=1.0)  # Avoid division by zero
+
+                        # Average attention per node
+                        node_att = node_att / edge_count
+                    else:
+                        # Node attention: use directly
+                        node_att = att_eps
+
+                    # Inverse scaling (more noise for lower attention)
+                    scale = (1.0 / node_att)
+                    
+                    # Apply scheduling to max_gauss_var
+                    if self.max_gauss_schedule == 'linear':
+                        progress = epoch / self.epochs
+                        current_max_var = 0.001 + (self.max_gauss_var - 0.001) * progress
+
+                    elif self.max_gauss_schedule == 'cosine':
+                        progress = epoch / self.epochs
+                        current_max_var = self.max_gauss_var * (1 - torch.cos(torch.tensor(progress * 3.14159))) / 2
+
+                    elif self.max_gauss_schedule == 'exp':
+                        progress = epoch / self.epochs
+                        current_max_var = 0.001 * ((self.max_gauss_var / 0.001) ** progress)
+
+                    elif self.max_gauss_schedule == 'step':
+                        if epoch < int(0.3 * self.epochs):
+                            current_max_var = 0.0
+                        else:
+                            progress = (epoch - 0.3 * self.epochs) / (0.7 * self.epochs)
+                            current_max_var = 0.0 + (self.max_gauss_var - 0.0) * progress
+
+                    elif self.max_gauss_schedule == 'sigmoid':
+                        progress = epoch / self.epochs
+                        k = 10.0  # steeper = faster ramp around midpoint
+                        current_max_var = self.max_gauss_var / (1 + torch.exp(-k * (progress - 0.5)))
+
+                    else:  # fixed
+                        current_max_var = self.max_gauss_var
+
+                    
+                    scale = (scale / scale.max()) * current_max_var  # max stddev (tunable)
+
+                    # Reshape to (N, 1) for broadcasting over embedding dim
+                    scale = scale.view(-1, 1)
+
+                    # Add noise
+                    noise = torch.randn_like(emb) * scale
+                    emb = emb + noise
+            else:
+                # Get attention scores from extractor (with gradients)
+                att_eps = torch.sigmoid(self.extractor(emb, data.edge_index, data.batch)) + 1e-6
+
+                if self.learn_edge_att:
+                    # Convert edge attention to node attention by averaging
+                    node_att = torch.zeros(emb.size(0), device=emb.device)
+
+                    # Squeeze to (num_edges,) then expand to (2, num_edges)
+                    edge_att_expanded = att_eps.squeeze(-1).unsqueeze(0).expand(2, -1)
+
+                    node_att.scatter_add_(0, data.edge_index.view(-1), edge_att_expanded.reshape(-1))
+
+                    # Count edges per node for averaging
+                    edge_count = torch.zeros(emb.size(0), device=emb.device)
+                    edge_count.scatter_add_(0, data.edge_index.view(-1),
+                                            torch.ones_like(data.edge_index.view(-1), dtype=torch.float))
+                    edge_count = torch.clamp(edge_count, min=1.0)  # Avoid division by zero
+
+                    # Average attention per node
+                    node_att = node_att / edge_count
+                else:
+                    # Node attention: use directly
+                    node_att = att_eps
+
+                # Inverse scaling (more noise for lower attention)
+                scale = (1.0 / node_att)
+                
+                # Apply scheduling to max_gauss_var
+                if self.max_gauss_schedule == 'linear':
+                    progress = epoch / self.epochs
+                    current_max_var = 0.001 + (self.max_gauss_var - 0.001) * progress
+
+                elif self.max_gauss_schedule == 'cosine':
+                    progress = epoch / self.epochs
+                    current_max_var = self.max_gauss_var * (1 - torch.cos(torch.tensor(progress * 3.14159))) / 2
+
+                elif self.max_gauss_schedule == 'exp':
+                    progress = epoch / self.epochs
+                    current_max_var = 0.001 * ((self.max_gauss_var / 0.001) ** progress)
+
+                elif self.max_gauss_schedule == 'step':
+                    if epoch < int(0.8 * self.epochs):
+                        current_max_var = 0.001
+                    else:
+                        progress = (epoch - 0.8 * self.epochs) / (0.2 * self.epochs)
+                        current_max_var = 0.001 + (self.max_gauss_var - 0.001) * progress
+
+                elif self.max_gauss_schedule == 'sigmoid':
+                    progress = epoch / self.epochs
+                    k = 10.0  # steeper = faster ramp around midpoint
+                    current_max_var = self.max_gauss_var / (1 + torch.exp(-k * (progress - 0.5)))
+
+                else:  # fixed
+                    current_max_var = self.max_gauss_var
+
+                
+                scale = (scale / scale.max()) * current_max_var  # max stddev (tunable)
+
+                # Reshape to (N, 1) for broadcasting over embedding dim
+                scale = scale.view(-1, 1)
+
+                # Add noise
+                noise = torch.randn_like(emb) * scale
+                emb = emb + noise
+
         att_log_logits = self.extractor(emb, data.edge_index, data.batch)
         att = self.sampling(att_log_logits, epoch, training)
 
@@ -96,7 +238,7 @@ class GSAT(nn.Module):
         loss, loss_dict = self.__loss__(att, clf_logits, data.y, epoch)
             
 
-        return edge_att, loss, loss_dict, clf_logits
+        return edge_att, loss, loss_dict, clf_logits, att
 
 
     @torch.no_grad()
@@ -104,14 +246,21 @@ class GSAT(nn.Module):
         self.extractor.eval()
         self.clf.eval()
         print()
-        att, loss, loss_dict, clf_logits = self.forward_pass(data, epoch, training=False)
+        att, loss, loss_dict, clf_logits, node_att = self.forward_pass(data, epoch, training=False)
         return att.data.cpu().reshape(-1), loss_dict, clf_logits.data.cpu()
 
     def train_one_batch(self, data, epoch):
         self.extractor.train()
         self.clf.train()
 
-        att, loss, loss_dict, clf_logits = self.forward_pass(data, epoch, training=True)
+        att, loss, loss_dict, clf_logits, node_att = self.forward_pass(data, epoch, training=True)
+        embeddings = self.clf.get_all_embeddings()
+
+        global all_embs
+        for key in embeddings:
+            all_embs[key].append((embeddings[key], data, node_att))
+
+
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
@@ -129,11 +278,6 @@ class GSAT(nn.Module):
             data = process_data(data, use_edge_attr)
             if self.dataset_name in ['NCI1', 'PROTEINS', 'AIDS']:
                 data.y = data.y.unsqueeze(-1)
-
-            global tempgotcha
-            if tempgotcha:
-                print(self.dataset_name ,'data', data)
-                tempgotcha = False
 
             att, loss_dict, clf_logits = run_one_batch(data.to(self.device), epoch)
 
@@ -164,11 +308,36 @@ class GSAT(nn.Module):
 
     def train(self, loaders, test_set, metric_dict, use_edge_attr):
         viz_set = self.get_viz_idx(test_set, self.dataset_name)
-        for epoch in range(self.epochs):
+        
+        # Convergence tracking - no improvement in val accuracy for patience epochs
+        best_val_accuracy = None
+        epochs_without_improvement = 0
+        convergence_epoch = None
+        patience = 50
+        
+        for epoch in range(300):
             train_res = self.run_one_epoch(loaders['train'], epoch, 'train', use_edge_attr)
             valid_res = self.run_one_epoch(loaders['valid'], epoch, 'valid', use_edge_attr)
             test_res = self.run_one_epoch(loaders['test'], epoch, 'test', use_edge_attr)
             self.writer.add_scalar('gsat_train/lr', get_lr(self.optimizer), epoch)
+            
+            # Check for convergence - no improvement in val accuracy for patience epochs
+            current_val_accuracy = valid_res[2]  # clf_acc is at index 2
+            
+            # Initialize best_val_accuracy on first epoch
+            if best_val_accuracy is None:
+                best_val_accuracy = current_val_accuracy
+            elif current_val_accuracy > best_val_accuracy:
+                best_val_accuracy = current_val_accuracy
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+                
+            # Check if we've reached convergence (no improvement for patience epochs)
+            if epochs_without_improvement >= patience and convergence_epoch is None:
+                convergence_epoch = epoch
+                print(f"[CONVERGENCE] Model converged at epoch {epoch} (no val accuracy improvement for {patience} epochs)")
+                print(f"[CONVERGENCE] Best val accuracy: {best_val_accuracy:.3f}, Current val accuracy: {current_val_accuracy:.3f}")
 
             assert len(train_res) == 5
             main_metric_idx = 3 if 'ogb' in self.dataset_name else 2  # clf_roc or clf_acc
@@ -206,6 +375,21 @@ class GSAT(nn.Module):
                   f'Best Test X AUROC: {metric_dict["metric/best_x_roc_test"]:.3f}')
             print('====================================')
             print('====================================')
+        
+        # Print convergence summary and ensure convergence_epoch is always in metric_dict
+        if convergence_epoch is not None:
+            print(f"[CONVERGENCE SUMMARY] Model converged at epoch {convergence_epoch} (no val accuracy improvement for {patience} epochs)")
+            print(f"[CONVERGENCE SUMMARY] Best validation accuracy achieved: {best_val_accuracy:.3f}")
+            # Ensure convergence_epoch is in the final metric_dict (it might have been lost if a better model was found after convergence)
+            metric_dict['metric/convergence_epoch'] = convergence_epoch
+        else:
+            print(f"[CONVERGENCE SUMMARY] Model did not converge within {self.epochs} epochs (no {patience}-epoch plateau in val accuracy)")
+            if best_val_accuracy is not None:
+                print(f"[CONVERGENCE SUMMARY] Best validation accuracy achieved: {best_val_accuracy:.3f}")
+            else:
+                print(f"[CONVERGENCE SUMMARY] No validation accuracy recorded")
+            metric_dict['metric/convergence_epoch'] = -1  # -1 indicates no convergence
+        
         return metric_dict
 
     def log_epoch(self, epoch, phase, loss_dict, exp_labels, att, precision_at_k, clf_labels, clf_logits, batch):
@@ -369,7 +553,7 @@ class ExtractorMLP(nn.Module):
         return att_log_logits
 
 
-def train_gsat_one_seed(local_config, data_dir, log_dir, model_name, dataset_name, method_name, device, random_state):
+def train_gsat_one_seed(local_config, data_dir, log_dir, model_name, dataset_name, method_name, device, random_state, save_embs=False, actual_model_name=None, gaussianize=False, max_gauss_var=0.05, max_gauss_schedule='fixed', nograd_on='on'):
     print('====================================')
     print('====================================')
     print(f'[INFO] Using device: {device}')
@@ -383,14 +567,17 @@ def train_gsat_one_seed(local_config, data_dir, log_dir, model_name, dataset_nam
     data_config = local_config['data_config']
     method_config = local_config[f'{method_name}_config']
     shared_config = local_config['shared_config']
-    assert model_config['model_name'] == model_name
+    assert model_config['model_name'] == (actual_model_name or model_name)
     assert method_config['method_name'] == method_name
 
     batch_size, splits = data_config['batch_size'], data_config.get('splits', None)
     loaders, test_set, x_dim, edge_attr_dim, num_class, aux_info = get_data_loaders(data_dir, dataset_name, batch_size, splits, random_state, data_config.get('mutag_x', False))
 
     model_config['deg'] = aux_info['deg']
-    model = get_model(x_dim, edge_attr_dim, num_class, aux_info['multi_label'], model_config, device)
+    # Save original model name and override to be the base name for get_model function
+    original_model_name = model_config['model_name']
+    model_config['model_name'] = model_name  
+    model = get_model(x_dim, edge_attr_dim, num_class, aux_info['multi_label'], model_config, device, save_embs=save_embs)
     print('====================================')
     print('====================================')
 
@@ -430,9 +617,13 @@ def train_gsat_one_seed(local_config, data_dir, log_dir, model_name, dataset_nam
 
     print('====================================')
     print('[INFO] Training GSAT...')
-    gsat = GSAT(model, extractor, optimizer, scheduler, writer, device, log_dir, dataset_name, num_class, aux_info['multi_label'], random_state, method_config, shared_config)
+    gsat = GSAT(model, extractor, optimizer, scheduler, writer, device, log_dir, dataset_name, num_class, aux_info['multi_label'], random_state, method_config, shared_config, gaussianize=gaussianize, max_gauss_var=max_gauss_var, max_gauss_schedule=max_gauss_schedule, nograd_on=nograd_on)
     metric_dict = gsat.train(loaders, test_set, metric_dict, model_config.get('use_edge_attr', True))
     writer.add_hparams(hparam_dict=hparam_dict, metric_dict=metric_dict)
+    
+    # Restore original model name for next seed
+    model_config['model_name'] = original_model_name
+    
     return hparam_dict, metric_dict
 
 
@@ -442,20 +633,33 @@ def main():
     parser.add_argument('--dataset', type=str, help='dataset used')
     parser.add_argument('--backbone', type=str, help='backbone model used')
     parser.add_argument('--cuda', type=int, help='cuda device id, -1 for cpu')
-    parser.add_argument('--exp_type', type=str, help='normal, noinfo, newmlp')
+
     parser.add_argument('--save_weights', type=bool, help='save activations')
+    parser.add_argument('--bottleneck_dim', type=str, required=True, help='dimensions for bottleneck FC layers (e.g., "16" or "48-32")')
+    parser.add_argument('--save_embs', action='store_true', help='save embeddings from model layers (default: False)')
+    parser.add_argument('--seeds', type=int, help='number of random seeds to run (overrides global config)')
+    parser.add_argument('--gaussianize', action='store_true', help='Add Gaussian noise to embeddings based on attention scores')
+    parser.add_argument('--max_gauss_var', type=float, default=0.05, help='Maximum Gaussian noise variance (default: 0.05)')
+    parser.add_argument('--max_gauss_schedule', type=str, default='fixed', choices=['fixed', 'linear', 'cosine', 'exp', 'step', 'sigmoid'], help='Gaussian noise scheduling strategy (default: fixed)')
+    parser.add_argument('--nograd_on', type=str, default='on', choices=['on', 'off'], help='Whether to use torch.no_grad() for gaussianize operations (default: on)')
+    parser.add_argument('--epochs', type=int, default=300, help='Number of epochs to train (default: 300)')
 
     args = parser.parse_args()
     dataset_name = args.dataset
     model_name = args.backbone
     cuda_id = args.cuda
-    global exp_type
-    exp_type = args.exp_type
+    
+    print('bottleneck_dim', args.bottleneck_dim)
 
-    print('exp_type', exp_type)
+    #print('TORCH GRAD IS ON FOR THIS GAUSSIANIZE')
 
     global save_weights
     save_weights = args.save_weights
+
+    from collections import defaultdict
+
+    global all_embs
+    all_embs = defaultdict(list)
 
     torch.set_num_threads(5)
     config_dir = Path('./configs')
@@ -475,22 +679,73 @@ def main():
     print(f"CUDA Available: {cuda_available}")
     print(f"Device: {device}")
     
-
+    print(f'save_embs: {args.save_embs}')
+    print(f'gaussianize: {args.gaussianize}')
+    print(f'max_gauss_var: {args.max_gauss_var}')
+    print(f'max_gauss_schedule: {args.max_gauss_schedule}')
+    
     global_config = yaml.safe_load((config_dir / 'global_config.yml').open('r'))
-    local_config_name = get_local_config_name(model_name, dataset_name)
+    
+    # Determine the actual model that will be used based on bottleneck_dim
+    if args.bottleneck_dim in ['normal', 'noinfo']:
+        actual_model_name = model_name  # Use regular model
+    else:
+        actual_model_name = f'{model_name}_with_fc_extractor'  # Use fc_extractor variant
+    
+    print(f'[INFO] Loading config for: {actual_model_name}')
+    local_config_name = get_local_config_name(actual_model_name, dataset_name)
     local_config = yaml.safe_load((config_dir / local_config_name).open('r'))
+    
+    # Parse bottleneck dimensions from string and add to model_config
+    if isinstance(args.bottleneck_dim, str):
+        # Skip parsing for special values
+        if args.bottleneck_dim in ['normal', 'noinfo']:
+            bottleneck_dims = None  # Won't be used for these special cases
+        else:
+            bottleneck_dims = [int(x) for x in args.bottleneck_dim.split('-')]
+    else:
+        bottleneck_dims = [args.bottleneck_dim]  # backwards compatibility
+    
+    local_config['model_config']['bottleneck_dims'] = bottleneck_dims
+    local_config['model_config']['bottleneck_dim'] = args.bottleneck_dim  # Keep original string for reference
+    local_config['GSAT_config']['bottleneck_dim'] = args.bottleneck_dim  # Also add to method config for GSAT class
 
     data_dir = Path(global_config['data_dir'])
-    num_seeds = global_config['num_seeds']
+    num_seeds = args.seeds if args.seeds is not None else global_config['num_seeds']
+    print(f'[INFO] Running with {num_seeds} seeds')
 
     time = datetime.now().strftime("%m_%d_%Y-%H_%M_%S")
     device = torch.device(f'cuda:{cuda_id}' if cuda_id >= 0 else 'cpu')
 
+    # Create embeddings folder if saving embeddings
+    if args.save_embs:
+        gaussianize_suffix = f'_gaussianize_var_{args.max_gauss_var}_sched_{args.max_gauss_schedule}_nograd_{args.nograd_on}' if args.gaussianize else ''
+        embeddings_folder = f'new_embeddings_{dataset_name}_{model_name}_{args.bottleneck_dim.replace("-", "_")}_{gaussianize_suffix}'
+        os.makedirs(embeddings_folder, exist_ok=True)
+        print(f'[INFO] Created embeddings folder: {embeddings_folder}')
+ 
+    print(f'[INFO] Gaussianize: {args.gaussianize}')
     metric_dicts = []
     for random_state in range(num_seeds):
         log_dir = data_dir / dataset_name / 'logs' / (time + '-' + dataset_name + '-' + model_name + '-seed' + str(random_state) + '-' + method_name)
-        hparam_dict, metric_dict = train_gsat_one_seed(local_config, data_dir, log_dir, model_name, dataset_name, method_name, device, random_state)
+        hparam_dict, metric_dict = train_gsat_one_seed(local_config, data_dir, log_dir, model_name, dataset_name, method_name, device, random_state, save_embs=args.save_embs, actual_model_name=actual_model_name, gaussianize=args.gaussianize, max_gauss_var=args.max_gauss_var, max_gauss_schedule=args.max_gauss_schedule, nograd_on=args.nograd_on)
         metric_dicts.append(metric_dict)
+
+        if args.save_embs:
+            # Save all embeddings that were collected during training  
+            print('[INFO] Saving embeddings...')
+            import pickle
+            gaussianize_suffix = f'_gaussianize_var_{args.max_gauss_var}_sched_{args.max_gauss_schedule}_nograd_{args.nograd_on}' if args.gaussianize else ''
+            embeddings_folder = f'new_embeddings_{dataset_name}_{model_name}_{args.bottleneck_dim.replace("-", "_")}_{gaussianize_suffix}'
+            embeddings_file = os.path.join(embeddings_folder, f'embeddings_seed_{random_state}.pkl')
+            with open(embeddings_file, 'wb') as f:
+                pickle.dump(all_embs, f)
+            print(f'[INFO] Embeddings saved to: {embeddings_file}')
+            print(f'[INFO] Number of embedding keys: {len(all_embs)}')
+            for key, embs in all_embs.items():
+                print(f'[INFO] Key {key}: {len(embs)} embeddings saved')
+            # Clear embeddings for next seed
+            all_embs.clear()
     print(metric_dicts)
     log_dir = data_dir / dataset_name / 'logs' / (time + '-' + dataset_name + '-' + model_name + '-seed99-' + method_name + '-stat')
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -500,27 +755,82 @@ def main():
     best_clf_valid = []
     best_clf_test = []
     best_x_roc_test = []
+    best_epochs = []
+    convergence_epochs = []
     for i, metric_dict in enumerate(metric_dicts):
         best_clf_valid.append(metric_dict["metric/best_clf_valid"])
         best_clf_test.append(metric_dict[ "metric/best_clf_test"])
         best_x_roc_test.append(metric_dict["metric/best_x_roc_test"])
+        best_epochs.append(metric_dict["metric/best_clf_epoch"])
+        convergence_epochs.append(metric_dict.get("metric/convergence_epoch", -1))
 
     
     agg_clf_valid = sum(best_clf_valid) / len(best_clf_valid)
     agg_clf_test = sum(best_clf_test) / len(best_clf_test)
-    agg_x_roc_test = sum(best_x_roc_test) / len(best_x_roc_test) 
+    agg_x_roc_test = sum(best_x_roc_test) / len(best_x_roc_test)
+    agg_best_epoch = sum(best_epochs) / len(best_epochs)
+    
+    # Calculate average convergence epoch (only for seeds that converged)
+    converged_epochs = [epoch for epoch in convergence_epochs if epoch != -1]
+    if converged_epochs:
+        agg_convergence_epoch = sum(converged_epochs) / len(converged_epochs)
+        convergence_rate = len(converged_epochs) / len(convergence_epochs)
+    else:
+        agg_convergence_epoch = -1
+        convergence_rate = 0.0 
 
     std_clf_test = np.std(best_clf_test, ddof=1)
     std_roc_test = np.std(best_x_roc_test, ddof=1)
 
-    print(f'Best Val Pred ACC/ROC: {agg_clf_valid:.3f}, Best Test Pred ACC/ROC: {agg_clf_test:.3f}, '
-                  f'Best Test X AUROC: {agg_x_roc_test:.3f}')  
-    
-    print(f"Std Dev Clf Acc Test: {std_clf_test:.3f} Std Dev Roc Test: {std_roc_test:.3f}")
+    print("="*60)
+    print("FINAL RESULTS SUMMARY")
+    print("="*60)
+    print(f"Dataset: {dataset_name}")
+    print(f"Model: {model_name}")
+    print(f"Bottleneck Dim: {args.bottleneck_dim}")
+    print(f"Gaussianize: {args.gaussianize}")
+    if args.gaussianize:
+        print(f"Max Gauss Var: {args.max_gauss_var}")
+        print(f"Gauss Schedule: {args.max_gauss_schedule}")
+        print(f"Nograd On: {args.nograd_on}")
+    print(f"Seeds: {num_seeds}")
+    print(f"Epochs: {args.epochs}")
+    print(f"CUDA Device: {cuda_id}")
+    print("-"*60)
+    print(f"Best Test Pred ACC/ROC:   {agg_clf_test:.3f} ± {std_clf_test:.3f}")
+    print(f"Best Test X AUROC:        {agg_x_roc_test:.3f} ± {std_roc_test:.3f}")
+    print(f"Average Best Epoch:       {agg_best_epoch:.1f}")
+    if agg_convergence_epoch != -1:
+        std_convergence_epoch = np.std(converged_epochs, ddof=1) if len(converged_epochs) > 1 else 0.0
+        print(f"Average Convergence Epoch: {agg_convergence_epoch:.1f} ± {std_convergence_epoch:.1f}")
+        print(f"Convergence Rate:         {convergence_rate:.1%}")
+    else:
+        print(f"Average Convergence Epoch: No convergence")
+        print(f"Convergence Rate:         0.0%")
+    print("-"*60)
+    print("="*60)
 
-    print(f'exp type: {exp_type}, dataset: {dataset_name} ')
+    
+    # Also print in a single line format for easy parsing
+    gauss_params = f"{args.max_gauss_var}|{args.max_gauss_schedule}|{args.nograd_on}" if args.gaussianize else "None|None|None"
+
+    if agg_convergence_epoch != -1:
+        std_convergence_epoch = np.std(converged_epochs, ddof=1) if len(converged_epochs) > 1 else 0.0
+        conv_epoch_str = f"{agg_convergence_epoch:.1f}±{std_convergence_epoch:.1f}"
+    else:
+        std_convergence_epoch = "NA"
+        conv_epoch_str = "NoConv"
+
+    print(
+        f"RESULT|{dataset_name}|{model_name}|{args.bottleneck_dim}|{args.gaussianize}|"
+        f"{gauss_params}|{num_seeds}|{agg_clf_test:.3f}|{agg_x_roc_test:.3f}|"
+        f"{std_clf_test:.3f}|{std_roc_test:.3f}|{agg_best_epoch:.1f}|"
+        f"{conv_epoch_str}|{convergence_rate:.1%}"
+    )
+
 
     if save_weights:
         print('activations', activations)
+
 if __name__ == '__main__':
     main()

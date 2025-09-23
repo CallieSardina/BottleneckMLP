@@ -39,6 +39,7 @@ parser.add_argument('--agg_method', type=str, choices=['attn', 'lstm', 'mean'], 
 parser.add_argument('--attn_mode', type=str, choices=['prod', 'map'], default='prod', help='use dot product attention or mapping based')
 parser.add_argument('--time', type=str, choices=['time', 'pos', 'empty'], help='how to use time information', default='time')
 parser.add_argument('--uniform', action='store_true', help='take uniform sampling from temporal neighbors')
+parser.add_argument('--gaussianize', action='store_true', help='add gaussian noise inversely proportional to node importance')
 parser.add_argument('-exp', '--exp_type', type=str, help='exp_type', default='normal')
 
 try:
@@ -56,6 +57,7 @@ NUM_HEADS = args.n_head
 DROP_OUT = args.drop_out
 GPU = args.gpu
 UNIFORM = args.uniform
+GAUSSIANIZE = args.gaussianize
 # NEW_NODE = args.new_node
 USE_TIME = args.time
 AGG_METHOD = args.agg_method
@@ -222,7 +224,7 @@ if EXP_TYPE == 'normal' or EXP_TYPE == 'noinfo':
 else:
     tgib = TGIB_with_fc(train_ngh_finder, n_feat, e_feat, 64,
                 num_layers=NUM_LAYER, use_time=USE_TIME, agg_method=AGG_METHOD, attn_mode=ATTN_MODE,
-                seq_len=SEQ_LEN, n_head=NUM_HEADS, drop_out=DROP_OUT, node_dim=NODE_DIM, time_dim=TIME_DIM)
+                seq_len=SEQ_LEN, n_head=NUM_HEADS, drop_out=DROP_OUT, node_dim=NODE_DIM, time_dim=TIME_DIM, gaussianize=GAUSSIANIZE)
 
 
 criterion = torch.nn.BCELoss()
